@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	monitoringv1 "github.com/GoogleCloudPlatform/prometheus-engine/pkg/operator/apis/monitoring/v1"
@@ -35,9 +36,35 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
+type operatorConfigValidator struct {
+	namespace    string
+	name         string
+	vpaAvailable *atomic.Bool
+}
+
+func (v *operatorConfigValidator) ValidateCreate(ctx context.Context, oc *monitoringv1.OperatorConfig) (admission.Warnings, error) {
+	return v.validator().ValidateCreate(ctx, oc)
+}
+
+func (v *operatorConfigValidator) ValidateUpdate(ctx context.Context, oldOC, oc *monitoringv1.OperatorConfig) (admission.Warnings, error) {
+	return v.validator().ValidateUpdate(ctx, oldOC, oc)
+}
+
+func (v *operatorConfigValidator) ValidateDelete(ctx context.Context, oc *monitoringv1.OperatorConfig) (admission.Warnings, error) {
+	return v.validator().ValidateDelete(ctx, oc)
+}
+
+func (v *operatorConfigValidator) validator() *monitoringv1.OperatorConfigValidator {
+	return &monitoringv1.OperatorConfigValidator{
+		Namespace:    v.namespace,
+		Name:         v.name,
+		VPAAvailable: v.vpaAvailable != nil && v.vpaAvailable.Load(),
+	}
+}
+
 // setupAdmissionWebhooks configures validating webhooks for the operator-managed
 // custom resources and registers handlers with the webhook server.
-func setupAdmissionWebhooks(ctx context.Context, logger logr.Logger, kubeClient client.Client, webhookServer *webhook.DefaultServer, opts *Options, vpaAvailable bool) error {
+func setupAdmissionWebhooks(ctx context.Context, logger logr.Logger, kubeClient client.Client, webhookServer *webhook.DefaultServer, opts *Options, vpaAvailable *atomic.Bool) error {
 	// Write provided cert files.
 	caBundle, err := ensureCerts(opts.OperatorNamespace, webhookServer.Options.CertDir, opts.TLSCert, opts.TLSKey, opts.CACert)
 	if err != nil {
@@ -56,10 +83,10 @@ func setupAdmissionWebhooks(ctx context.Context, logger logr.Logger, kubeClient 
 	// Validating webhooks.
 	webhookServer.Register(
 		validatePath(monitoringv1.OperatorConfigResource()),
-		admission.WithValidator(scheme, &monitoringv1.OperatorConfigValidator{
-			Namespace:    opts.PublicNamespace,
-			Name:         NameOperatorConfig,
-			VPAAvailable: vpaAvailable,
+		admission.WithValidator(scheme, &operatorConfigValidator{
+			namespace:    opts.PublicNamespace,
+			name:         NameOperatorConfig,
+			vpaAvailable: vpaAvailable,
 		}),
 	)
 	webhookServer.Register(

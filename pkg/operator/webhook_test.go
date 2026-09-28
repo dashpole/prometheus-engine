@@ -417,7 +417,7 @@ func TestWebhookCABundleUpdate(t *testing.T) {
 				},
 			}
 
-			if err := setupAdmissionWebhooks(t.Context(), logr.Discard(), kubeClient, webhookServer, &opts, false); err != nil {
+			if err := setupAdmissionWebhooks(t.Context(), logr.Discard(), kubeClient, webhookServer, &opts, nil); err != nil {
 				t.Fatal(err)
 			}
 

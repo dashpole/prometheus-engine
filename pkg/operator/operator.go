@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/api"
@@ -31,6 +32,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -42,6 +44,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -94,8 +97,9 @@ type Operator struct {
 	logger       logr.Logger
 	opts         Options
 	client       client.Client
+	clientset    apiextensions.Interface
 	manager      manager.Manager
-	vpaAvailable bool
+	vpaAvailable atomic.Bool
 }
 
 // Options for the Operator.
@@ -180,6 +184,58 @@ func NewScheme() (*runtime.Scheme, error) {
 	return sc, nil
 }
 
+// newRESTMapper creates a RESTMapper that resolves known operator resource types
+// statically in memory before falling back to dynamic API discovery, avoiding
+// synchronous kube-apiserver discovery calls during manager initialization.
+func newRESTMapper(cfg *rest.Config, httpClient *http.Client) (meta.RESTMapper, error) {
+	dynamicMapper, err := apiutil.NewDynamicRESTMapper(cfg, httpClient)
+	if err != nil {
+		return nil, err
+	}
+
+	staticMapper := meta.NewDefaultRESTMapper(nil)
+	staticMapper.Add(corev1.SchemeGroupVersion.WithKind("Pod"), meta.RESTScopeNamespace)
+	staticMapper.Add(corev1.SchemeGroupVersion.WithKind("Secret"), meta.RESTScopeNamespace)
+	staticMapper.Add(corev1.SchemeGroupVersion.WithKind("Service"), meta.RESTScopeNamespace)
+	staticMapper.Add(corev1.SchemeGroupVersion.WithKind("ConfigMap"), meta.RESTScopeNamespace)
+	staticMapper.Add(appsv1.SchemeGroupVersion.WithKind("DaemonSet"), meta.RESTScopeNamespace)
+	staticMapper.Add(appsv1.SchemeGroupVersion.WithKind("Deployment"), meta.RESTScopeNamespace)
+	staticMapper.Add(appsv1.SchemeGroupVersion.WithKind("StatefulSet"), meta.RESTScopeNamespace)
+	staticMapper.Add(arv1.SchemeGroupVersion.WithKind("ValidatingWebhookConfiguration"), meta.RESTScopeRoot)
+	staticMapper.Add(arv1.SchemeGroupVersion.WithKind("MutatingWebhookConfiguration"), meta.RESTScopeRoot)
+	staticMapper.Add(autoscalingv1.SchemeGroupVersion.WithKind("VerticalPodAutoscaler"), meta.RESTScopeNamespace)
+
+	staticMapper.Add(monitoringv1.SchemeGroupVersion.WithKind("PodMonitoring"), meta.RESTScopeNamespace)
+	staticMapper.Add(monitoringv1.SchemeGroupVersion.WithKind("ClusterPodMonitoring"), meta.RESTScopeRoot)
+	staticMapper.Add(monitoringv1.SchemeGroupVersion.WithKind("ClusterNodeMonitoring"), meta.RESTScopeRoot)
+	staticMapper.Add(monitoringv1.SchemeGroupVersion.WithKind("OperatorConfig"), meta.RESTScopeNamespace)
+	staticMapper.AddSpecific(
+		monitoringv1.SchemeGroupVersion.WithKind("Rules"),
+		monitoringv1.SchemeGroupVersion.WithResource("rules"),
+		monitoringv1.SchemeGroupVersion.WithResource("rules"),
+		meta.RESTScopeNamespace,
+	)
+	staticMapper.AddSpecific(
+		monitoringv1.SchemeGroupVersion.WithKind("ClusterRules"),
+		monitoringv1.SchemeGroupVersion.WithResource("clusterrules"),
+		monitoringv1.SchemeGroupVersion.WithResource("clusterrules"),
+		meta.RESTScopeRoot,
+	)
+	staticMapper.AddSpecific(
+		monitoringv1.SchemeGroupVersion.WithKind("GlobalRules"),
+		monitoringv1.SchemeGroupVersion.WithResource("globalrules"),
+		monitoringv1.SchemeGroupVersion.WithResource("globalrules"),
+		meta.RESTScopeRoot,
+	)
+
+	return meta.FirstHitRESTMapper{
+		MultiRESTMapper: meta.MultiRESTMapper{
+			staticMapper,
+			dynamicMapper,
+		},
+	}, nil
+}
+
 // New instantiates a new Operator.
 func New(logger logr.Logger, clientConfig *rest.Config, opts Options) (*Operator, error) {
 	if err := opts.defaultAndValidate(logger); err != nil {
@@ -258,31 +314,24 @@ func New(logger logr.Logger, clientConfig *rest.Config, opts Options) (*Operator
 				"metadata.name":      NameAlertmanager,
 			}),
 		},
+		&autoscalingv1.VerticalPodAutoscaler{}: {
+			Field: fields.SelectorFromSet(fields.Set{
+				"metadata.namespace": opts.OperatorNamespace,
+			}),
+		},
 	}
 
-	// Determine whether VPA is installed in the cluster. If so, set up the scaling controller.
-	var vpaAvailable bool
 	coreClientConfig := rest.CopyConfig(clientConfig)
 	coreClientConfig.ContentType = runtime.ContentTypeProtobuf
 	clientset, err := apiextensions.NewForConfig(coreClientConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create clientset: %w", err)
 	}
-	if _, err := clientset.ApiextensionsV1().CustomResourceDefinitions().Get(context.Background(), "verticalpodautoscalers.autoscaling.k8s.io", metav1.GetOptions{}); err != nil {
-		logger.Info("vertical pod autoscaling is not available, scaling.vpa.enabled option on the OperatorConfig will not work")
-	} else {
-		logger.Info("vertical pod autoscaling available, monitoring OperatorConfig for scaling.vpa.enabled option")
-		vpaAvailable = true
-		watchObjects[&autoscalingv1.VerticalPodAutoscaler{}] = cache.ByObject{
-			Field: fields.SelectorFromSet(fields.Set{
-				"metadata.namespace": opts.OperatorNamespace,
-			}),
-		}
-	}
 
 	manager, err := ctrl.NewManager(clientConfig, manager.Options{
-		Logger: logger,
-		Scheme: sc,
+		Logger:         logger,
+		Scheme:         sc,
+		MapperProvider: newRESTMapper,
 		WebhookServer: webhook.NewServer(webhook.Options{
 			Host:    host,
 			Port:    port,
@@ -295,15 +344,11 @@ func New(logger logr.Logger, clientConfig *rest.Config, opts Options) (*Operator
 		},
 		HealthProbeBindAddress: opts.ProbeAddr,
 		// Manage cluster-wide and namespace resources at the same time.
-		NewCache: cache.NewCacheFunc(func(_ *rest.Config, options cache.Options) (cache.Cache, error) {
-			return cache.New(clientConfig, cache.Options{
-				Scheme: options.Scheme,
-
-				// The presence of metadata.namespace has special handling internally causing the
-				// cache's watch-list to only watch that namespace.
-				ByObject: watchObjects,
-			})
-		}),
+		Cache: cache.Options{
+			// The presence of metadata.namespace has special handling internally causing the
+			// cache's watch-list to only watch that namespace.
+			ByObject: watchObjects,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create controller manager: %w", err)
@@ -317,17 +362,20 @@ func New(logger logr.Logger, clientConfig *rest.Config, opts Options) (*Operator
 		return nil, fmt.Errorf("add readyz check for webhooks: %w", err)
 	}
 
-	client, err := client.New(clientConfig, client.Options{Scheme: sc})
+	client, err := client.New(clientConfig, client.Options{
+		Scheme: sc,
+		Mapper: manager.GetRESTMapper(),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("create client: %w", err)
 	}
 
 	op := &Operator{
-		logger:       logger,
-		opts:         opts,
-		client:       client,
-		manager:      manager,
-		vpaAvailable: vpaAvailable,
+		logger:    logger,
+		opts:      opts,
+		client:    client,
+		clientset: clientset,
+		manager:   manager,
 	}
 	return op, nil
 }
@@ -338,10 +386,7 @@ func New(logger logr.Logger, clientConfig *rest.Config, opts Options) (*Operator
 func (o *Operator) Run(ctx context.Context, registry prometheus.Registerer) error {
 	defer runtimeutil.HandleCrash()
 
-	if err := o.cleanupOldResources(ctx); err != nil {
-		return fmt.Errorf("cleanup old resources: %w", err)
-	}
-	if err := setupAdmissionWebhooks(ctx, o.logger, o.client, o.manager.GetWebhookServer().(*webhook.DefaultServer), &o.opts, o.vpaAvailable); err != nil {
+	if err := setupAdmissionWebhooks(ctx, o.logger, o.client, o.manager.GetWebhookServer().(*webhook.DefaultServer), &o.opts, &o.vpaAvailable); err != nil {
 		return fmt.Errorf("init admission resources: %w", err)
 	}
 	if err := setupCollectionControllers(o); err != nil {
@@ -353,17 +398,36 @@ func (o *Operator) Run(ctx context.Context, registry prometheus.Registerer) erro
 	if err := setupOperatorConfigControllers(o); err != nil {
 		return fmt.Errorf("setup rule-evaluator controllers: %w", err)
 	}
-	if o.vpaAvailable {
-		if err := setupScalingController(o); err != nil {
-			return fmt.Errorf("setup scaling controllers: %w", err)
-		}
-	}
 	if err := setupTargetStatusPoller(o, registry, o.opts.CollectorHTTPClient); err != nil {
 		return fmt.Errorf("setup target status processor: %w", err)
+	}
+	if err := o.manager.Add(manager.RunnableFunc(o.cleanupOldResources)); err != nil {
+		return fmt.Errorf("add cleanup old resources runnable: %w", err)
+	}
+	if err := o.manager.Add(manager.RunnableFunc(o.setupVPA)); err != nil {
+		return fmt.Errorf("add setup VPA runnable: %w", err)
 	}
 
 	o.logger.Info("starting GMP operator")
 	return o.manager.Start(ctx)
+}
+
+func (o *Operator) setupVPA(ctx context.Context) error {
+	// Determine whether VPA is installed in the cluster. If so, set up the scaling controller.
+	if o.clientset != nil {
+		if _, err := o.clientset.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, "verticalpodautoscalers.autoscaling.k8s.io", metav1.GetOptions{}); err != nil {
+			o.logger.Info("vertical pod autoscaling is not available, scaling.vpa.enabled option on the OperatorConfig will not work")
+		} else {
+			o.logger.Info("vertical pod autoscaling available, monitoring OperatorConfig for scaling.vpa.enabled option")
+			o.vpaAvailable.Store(true)
+		}
+	}
+	if o.vpaAvailable.Load() {
+		if err := setupScalingController(o); err != nil {
+			return fmt.Errorf("setup scaling controllers: %w", err)
+		}
+	}
+	return nil
 }
 
 func (o *Operator) cleanupOldResources(ctx context.Context) error {

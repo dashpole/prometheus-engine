@@ -15,15 +15,27 @@
 package operator
 
 import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
-
-	appsv1 "k8s.io/api/apps/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"time"
 
 	"github.com/go-logr/logr/testr"
+	"github.com/prometheus/client_golang/prometheus"
+	appsv1 "k8s.io/api/apps/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apiextensionsfake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	monitoringv1 "github.com/GoogleCloudPlatform/prometheus-engine/pkg/operator/apis/monitoring/v1"
 )
 
 func TestCleanupOldResources(t *testing.T) {
@@ -160,5 +172,138 @@ func TestCleanupOldResources(t *testing.T) {
 				t.Error("rule-evaluator Deployment differs")
 			}
 		})
+	}
+}
+
+func freeLocalAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on ephemeral port: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close ephemeral listener: %v", err)
+	}
+	return addr
+}
+
+func TestHealthServerStartsWhileAPIServerUnresponsive(t *testing.T) {
+	unblockAPIServer := make(chan struct{})
+	apiserver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-unblockAPIServer
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(func() {
+		close(unblockAPIServer)
+		apiserver.Close()
+	})
+
+	probeAddr := freeLocalAddr(t)
+	webhookAddr := freeLocalAddr(t)
+
+	op, err := New(testr.New(t), &rest.Config{Host: apiserver.URL}, Options{
+		ProjectID:         "test-proj",
+		Location:          "test-loc",
+		Cluster:           "test-cluster",
+		OperatorNamespace: DefaultOperatorNamespace,
+		PublicNamespace:   DefaultPublicNamespace,
+		ProbeAddr:         probeAddr,
+		ListenAddr:        webhookAddr,
+		CertDir:           t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("New() failed while kube-apiserver was unresponsive: %v", err)
+	}
+
+	runCtx, cancelRun := context.WithCancel(t.Context())
+	runErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- op.Run(runCtx, prometheus.NewRegistry())
+	}()
+	t.Cleanup(func() {
+		cancelRun()
+		<-runErrCh
+	})
+
+	httpClient := &http.Client{Timeout: 500 * time.Millisecond}
+	for _, endpoint := range []string{"/healthz", "/readyz"} {
+		url := fmt.Sprintf("http://%s%s", probeAddr, endpoint)
+		err := wait.PollUntilContextTimeout(t.Context(), 50*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if err != nil {
+				return false, err
+			}
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				return false, nil
+			}
+			defer resp.Body.Close()
+			return resp.StatusCode == http.StatusOK, nil
+		})
+		if err != nil {
+			t.Fatalf("probe %s did not become healthy while kube-apiserver was unresponsive: %v", endpoint, err)
+		}
+	}
+}
+
+func TestOperatorConfigValidatorVPAAvailability(t *testing.T) {
+	oc := &monitoringv1.OperatorConfig{
+		ObjectMeta: v1.ObjectMeta{
+			Namespace: DefaultPublicNamespace,
+			Name:      NameOperatorConfig,
+		},
+		Scaling: monitoringv1.ScalingSpec{
+			VPA: monitoringv1.VPASpec{
+				Enabled: true,
+			},
+		},
+	}
+
+	op, err := New(testr.New(t), &rest.Config{Host: "http://127.0.0.1:1"}, Options{
+		ProjectID:         "test-proj",
+		Location:          "test-loc",
+		Cluster:           "test-cluster",
+		OperatorNamespace: DefaultOperatorNamespace,
+		PublicNamespace:   DefaultPublicNamespace,
+		ProbeAddr:         "0",
+		ListenAddr:        freeLocalAddr(t),
+		CertDir:           t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	op.clientset = apiextensionsfake.NewClientset()
+
+	validator := &operatorConfigValidator{
+		namespace:    DefaultPublicNamespace,
+		name:         NameOperatorConfig,
+		vpaAvailable: &op.vpaAvailable,
+	}
+
+	if err := op.setupVPA(t.Context()); err != nil {
+		t.Fatalf("setupVPA without CRD failed: %v", err)
+	}
+	if op.vpaAvailable.Load() {
+		t.Fatal("expected vpaAvailable to be false when CRD is not installed")
+	}
+	if _, err := validator.ValidateCreate(t.Context(), oc); err == nil {
+		t.Fatal("expected ValidateCreate to reject VPA-enabled OperatorConfig when VPA is unavailable")
+	}
+
+	vpaCRD := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: v1.ObjectMeta{
+			Name: "verticalpodautoscalers.autoscaling.k8s.io",
+		},
+	}
+	op.clientset = apiextensionsfake.NewClientset(vpaCRD)
+	if err := op.setupVPA(t.Context()); err != nil {
+		t.Fatalf("setupVPA with CRD failed: %v", err)
+	}
+	if !op.vpaAvailable.Load() {
+		t.Fatal("expected vpaAvailable to be true when CRD is installed")
+	}
+	if _, err := validator.ValidateCreate(t.Context(), oc); err != nil {
+		t.Fatalf("expected ValidateCreate to allow VPA-enabled OperatorConfig when VPA is available, got: %v", err)
 	}
 }
